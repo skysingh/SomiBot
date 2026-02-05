@@ -45,6 +45,9 @@ import time
 import json
 import csv
 import os
+import argparse
+import serial
+import threading
 from datetime import datetime
 import RPi.GPIO as GPIO
 import numpy as np
@@ -64,6 +67,11 @@ AUX5_PIN = 18
 
 # Auxiliary pins list for easy iteration
 AUX_PINS = [AUX1_PIN, AUX2_PIN, AUX3_PIN, AUX4_PIN, AUX5_PIN]
+
+# Teensy Serial Configuration
+TEENSY_PORT = '/dev/serial0'  # TX1/RX1 on RPi
+TEENSY_BAUD = 115200
+TEENSY_TIMEOUT = 30  # Seconds to wait for COMPLETE/FAILED
 
 # LED Colors
 LED_BLUE = [0, 0, 255]    # Ready
@@ -107,10 +115,22 @@ class MyBuddyTrainer:
         
         # Auxiliary output states (all OFF at startup)
         self.aux_states = [0, 0, 0, 0, 0]  # aux1-aux5
-        
+
+        # Teensy serial communication
+        self.teensy = None
+        self.teensy_status = {}
+        self.teensy_lock = threading.Lock()
+        try:
+            self.teensy = serial.Serial(TEENSY_PORT, TEENSY_BAUD, timeout=0.1)
+            self.teensy.reset_input_buffer()
+            print(f"  ✓ Teensy connected on {TEENSY_PORT}")
+        except Exception as e:
+            print(f"  ⚠ Teensy not available: {e}")
+
         # Setup GPIO
         GPIO.setmode(GPIO.BCM)
-        
+        GPIO.setwarnings(False)
+
         # Inputs
         GPIO.setup(DEADMAN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(RECORD_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -160,6 +180,12 @@ class MyBuddyTrainer:
             print("  ⚠ Warning: Right arm not responding")
         if not test_waist or len(test_waist) == 0:
             print("  ⚠ Warning: Waist not responding")
+
+        # Store home position (startup position)
+        self.home_left = test_left if test_left else []
+        self.home_right = test_right if test_right else []
+        self.home_waist = test_waist[0] if test_waist else 0
+        print(f"  ✓ Home position saved")
         
         # Test gripper communication
         print("Testing grippers...")
@@ -202,6 +228,13 @@ class MyBuddyTrainer:
         # Turn off all auxiliary outputs
         for pin in AUX_PINS:
             GPIO.output(pin, GPIO.LOW)
+        # Close Teensy serial connection
+        if self.teensy:
+            try:
+                self.teensy.close()
+                print("  ✓ Teensy disconnected")
+            except:
+                pass
         self.set_led_color(0, 0, 0)
         GPIO.cleanup()
     
@@ -488,7 +521,147 @@ class MyBuddyTrainer:
             time.sleep(0.3)
         except Exception as e:
             print(f"Waist lock error: {e}")
-    
+
+    # === HOME POSITION ===
+    def go_home(self, speed=30):
+        """Move all arms to home position"""
+        print("\nMoving to home position...")
+        try:
+            if self.home_left and len(self.home_left) == 6:
+                print("  → Left arm...")
+                self.mybuddy.send_angles(1, self.home_left, speed)
+            if self.home_right and len(self.home_right) == 6:
+                print("  → Right arm...")
+                self.mybuddy.send_angles(2, self.home_right, speed)
+            if self.home_waist is not None:
+                print("  → Waist...")
+                self.mybuddy.send_angle(3, 1, self.home_waist, speed)
+            time.sleep(2)
+            print("  ✓ Home position reached\n")
+        except Exception as e:
+            print(f"  ✗ Error going home: {e}\n")
+
+    def set_home(self):
+        """Set current position as new home"""
+        print("\nSetting current position as home...")
+        try:
+            self.home_left = self.mybuddy.get_angles(1)
+            self.home_right = self.mybuddy.get_angles(2)
+            waist = self.mybuddy.get_angles(3)
+            self.home_waist = waist[0] if waist else 0
+            print(f"  Left:  {self.home_left}")
+            print(f"  Right: {self.home_right}")
+            print(f"  Waist: {self.home_waist:.1f}°")
+            print("  ✓ New home position saved\n")
+        except Exception as e:
+            print(f"  ✗ Error setting home: {e}\n")
+
+    def show_home(self):
+        """Display current home position"""
+        print("\nHome position:")
+        print(f"  Left:  {self.home_left}")
+        print(f"  Right: {self.home_right}")
+        print(f"  Waist: {self.home_waist:.1f}°\n")
+
+    # === TEENSY COMMUNICATION ===
+    def teensy_send(self, cmd):
+        """Send command to Teensy"""
+        if not self.teensy:
+            print("  ⚠ Teensy not connected")
+            return False
+        try:
+            self.teensy.write(f"{cmd}\n".encode())
+            print(f"  → Teensy TX: {cmd}")
+            return True
+        except Exception as e:
+            print(f"  ✗ Teensy send error: {e}")
+            return False
+
+    def teensy_read_status(self):
+        """Read and parse JSON status from Teensy"""
+        if not self.teensy:
+            return None
+        try:
+            if self.teensy.in_waiting > 0:
+                line = self.teensy.readline().decode().strip()
+                if line.startswith('{'):
+                    with self.teensy_lock:
+                        self.teensy_status = json.loads(line)
+                    return self.teensy_status
+        except Exception as e:
+            pass
+        return None
+
+    def teensy_start_channel(self, channel):
+        """Start a Teensy channel (1-4) and record to sequence"""
+        if channel < 1 or channel > 4:
+            print(f"  ⚠ Invalid channel {channel} (use 1-4)")
+            return False
+        return self.teensy_send(f"START{channel}")
+
+    def teensy_stop_channel(self, channel):
+        """Stop a Teensy channel (1-4)"""
+        if channel < 1 or channel > 4:
+            print(f"  ⚠ Invalid channel {channel} (use 1-4)")
+            return False
+        return self.teensy_send(f"STOP{channel}")
+
+    def teensy_set_setpoint(self, ml):
+        """Set Teensy setpoint in mL"""
+        if ml < 50 or ml > 500:
+            print(f"  ⚠ Invalid setpoint {ml} (use 50-500)")
+            return False
+        return self.teensy_send(f"SP={ml}")
+
+    def teensy_wait_complete(self, channel, timeout=TEENSY_TIMEOUT):
+        """Wait for channel to complete or fail"""
+        if not self.teensy:
+            print("  ⚠ Teensy not connected - skipping wait")
+            return "SKIPPED"
+
+        print(f"  ⏳ Waiting for Teensy CH{channel} (timeout {timeout}s)...")
+        start_time = time.time()
+        last_state = None
+
+        while time.time() - start_time < timeout:
+            self.teensy_read_status()
+
+            with self.teensy_lock:
+                if self.teensy_status and 'channels' in self.teensy_status:
+                    ch_data = self.teensy_status['channels'][channel - 1]
+                    state = ch_data.get('state', 'IDLE')
+                    ml = ch_data.get('ml', 0)
+
+                    if state != last_state:
+                        print(f"  → CH{channel}: {state} ({ml:.1f} mL)")
+                        last_state = state
+
+                    if state == 'COMPLETE':
+                        print(f"  ✓ CH{channel} COMPLETE ({ml:.1f} mL)")
+                        return "COMPLETE"
+                    elif state == 'FAILED':
+                        print(f"  ✗ CH{channel} FAILED ({ml:.1f} mL)")
+                        return "FAILED"
+
+            time.sleep(0.2)
+
+        print(f"  ✗ CH{channel} TIMEOUT after {timeout}s")
+        return "TIMEOUT"
+
+    def record_teensy_action(self, channel):
+        """Record a Teensy channel action to the sequence"""
+        timestamp = time.time()
+        time_from_start = timestamp - self.start_time
+
+        self.recorded_positions.append({
+            'type': 'teensy',
+            'channel': channel,
+            'timestamp': timestamp,
+            'time_from_start': time_from_start,
+            'delay': 0.5
+        })
+        print(f"✓ Recorded Teensy CH{channel} action (position {len(self.recorded_positions)})\n")
+
     # === RECORDING ===
     def record_position(self, arm):
         print(f"  → Reading waist position...")
@@ -620,34 +793,42 @@ class MyBuddyTrainer:
         if not self.recorded_positions:
             print("No positions to save")
             return
-        
+
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"recording_{timestamp}.csv"
-        
+
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['arm', 'waist', 'gripper', 'gripper_type', 'j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'delay', 'aux1', 'aux2', 'aux3', 'aux4', 'aux5'])
-            
+            writer.writerow(['type', 'arm', 'waist', 'gripper', 'gripper_type', 'j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'delay', 'aux1', 'aux2', 'aux3', 'aux4', 'aux5', 'teensy_ch'])
+
             for i, pos in enumerate(self.recorded_positions):
+                # Handle Teensy type positions
+                if pos.get('type') == 'teensy':
+                    row = ['teensy', '', '', '', '', '', '', '', '', '', '',
+                           f"{pos.get('delay', 0.5):.2f}", '', '', '', '', '', pos.get('channel', 1)]
+                    writer.writerow(row)
+                    continue
+
                 if i + 1 < len(self.recorded_positions):
                     time_diff = self.recorded_positions[i+1]['time_from_start'] - pos['time_from_start']
                     default_delay = max(5.0, time_diff) if time_diff > 0.01 else 5.0
                 else:
                     default_delay = 5.0
-                
+
                 aux = pos.get('aux', [0, 0, 0, 0, 0])
-                
+
                 row = [
+                    'position',
                     pos['arm'],
                     f"{pos.get('waist', 0.0):.2f}",
                     pos.get('gripper', 0),
                     pos.get('gripper_type', 'parallel' if pos['arm'] == 'left' else 'flexible')
                 ] + [f"{a:.2f}" for a in pos['angles']] + [
                     f"{pos.get('delay', default_delay):.2f}"
-                ] + aux
+                ] + aux + ['']
                 writer.writerow(row)
-        
+
         print(f"✓ Saved: {filename}")
         print(f"  Left gripper type: {self.right_gripper_type}")
         print(f"  Includes AUX columns: aux1, aux2, aux3, aux4, aux5")
@@ -731,33 +912,55 @@ class MyBuddyTrainer:
                 first_time = None
                 left_count = 0
                 right_count = 0
-                
+                teensy_count = 0
+
+                has_type_column = 'type' in reader.fieldnames
+                has_teensy_ch_column = 'teensy_ch' in reader.fieldnames
+
                 for i, row in enumerate(reader):
                     try:
+                        # Check if this is a Teensy action row
+                        if has_type_column and row.get('type', '').strip().lower() == 'teensy':
+                            channel = int(row.get('teensy_ch', 1)) if has_teensy_ch_column else 1
+                            delay = float(row['delay']) if has_delay_column and row.get('delay') else 0.5
+
+                            if first_time is None:
+                                first_time = time.time()
+
+                            self.recorded_positions.append({
+                                'type': 'teensy',
+                                'channel': channel,
+                                'delay': delay,
+                                'timestamp': first_time,
+                                'time_from_start': 0
+                            })
+                            teensy_count += 1
+                            continue
+
                         angles = [float(row[f'j{j}']) for j in range(1, 7)]
-                        
+
                         arm = row['arm'].strip().lower()
                         waist = float(row['waist'])
                         gripper = int(float(row['gripper'])) if has_gripper_column else 0
-                        
+
                         if has_gripper_type_column:
                             gripper_type = row['gripper_type'].strip().lower()
                         else:
                             gripper_type = 'vacuum' if (arm == 'left' and self.right_gripper_type == RIGHT_GRIPPER_VACUUM) else ('parallel' if arm == 'left' else 'flexible')
-                        
+
                         delay = float(row['delay']) if has_delay_column else 5.0
-                        
+
                         if has_aux_columns:
                             aux = [int(row[f'aux{j}']) for j in range(1, 6)]
                         else:
                             aux = [0, 0, 0, 0, 0]
-                        
+
                         time_value = float(row.get('time', 0))
-                        
+
                         if first_time is None:
                             first_time = time.time()
                         timestamp = first_time + time_value
-                        
+
                         self.recorded_positions.append({
                             'arm': arm,
                             'angles': angles,
@@ -769,12 +972,12 @@ class MyBuddyTrainer:
                             'timestamp': timestamp,
                             'time_from_start': time_value
                         })
-                        
+
                         if arm == 'left':
                             left_count += 1
                         elif arm == 'right':
                             right_count += 1
-                        
+
                     except (ValueError, KeyError) as e:
                         print(f"⚠ Warning: Skipping row {i+2} due to error: {e}")
                         continue
@@ -787,7 +990,9 @@ class MyBuddyTrainer:
             print(f"Total positions: {total_positions}")
             print(f"  Left arm:  {left_count} positions")
             print(f"  Right arm: {right_count} positions")
-            
+            if teensy_count > 0:
+                print(f"  Teensy:    {teensy_count} actions")
+
             total_delay = sum(pos.get('delay', 5.0) for pos in self.recorded_positions)
             estimated_time = total_delay + (total_positions * 3)
             print(f"Estimated replay time: {estimated_time:.1f} seconds ({estimated_time/60:.1f} minutes)")
@@ -828,8 +1033,32 @@ class MyBuddyTrainer:
                 i = 0
                 while i < len(self.recorded_positions):
                     pos_start_time = time.time()
-                    
+
                     pos = self.recorded_positions[i]
+
+                    # Handle Teensy actions
+                    if pos.get('type') == 'teensy':
+                        channel = pos.get('channel', 1)
+                        elapsed = time.time() - replay_start_time
+                        print(f"[{elapsed:6.1f}s] Position {i+1}/{len(self.recorded_positions)} | TEENSY CH{channel}")
+
+                        # Send START command and wait for completion
+                        if self.teensy_start_channel(channel):
+                            result = self.teensy_wait_complete(channel)
+                            if result == "COMPLETE":
+                                print(f"{'':11s} ✓ CH{channel} completed successfully")
+                            elif result == "FAILED":
+                                print(f"{'':11s} ✗ CH{channel} failed - continuing sequence")
+                            elif result == "TIMEOUT":
+                                print(f"{'':11s} ⚠ CH{channel} timed out - continuing sequence")
+                            else:
+                                print(f"{'':11s} → CH{channel} skipped (no Teensy)")
+                        else:
+                            print(f"{'':11s} ⚠ Failed to send START command")
+
+                        i += 1
+                        continue
+
                     arm_id = 1 if pos['arm'] == 'left' else 2
                     arm_name = pos['arm'].upper()
                     waist = pos.get('waist', 0.0)
@@ -862,7 +1091,18 @@ class MyBuddyTrainer:
                     
                     # Move arm
                     self.mybuddy.send_angles(arm_id, pos['angles'], speed)
-                    
+                    time.sleep(delay)  # Wait for arm to reach position
+
+                    # Debug: Check actual position reached
+                    actual_angles = self.mybuddy.get_angles(arm_id)
+                    if actual_angles:
+                        diffs = [abs(a - t) for a, t in zip(actual_angles, pos['angles'])]
+                        max_diff = max(diffs)
+                        if max_diff > 5:
+                            print(f"{'':11s} ⚠ Position error: max diff = {max_diff:.1f}°")
+                            actual_str = ", ".join([f"{a:6.1f}°" for a in actual_angles])
+                            print(f"{'':11s}   Actual: [{actual_str}]")
+
                     # Set gripper
                     if gripper_type == 'vacuum':
                         if gripper >= 50:
@@ -1033,18 +1273,24 @@ class MyBuddyTrainer:
         print("  w<angle> - Set waist (e.g., w45 or w-30)")
         print("  wf  - Free waist for manual movement")
         print("  wl  - Lock waist")
+        print("\nTeensy Control (pump channels):")
+        print("  t1  - Record Teensy CH1 start (wait for complete)")
+        print("  t2  - Record Teensy CH2 start (wait for complete)")
+        print("  t3  - Record Teensy CH3 start (wait for complete)")
+        print("  t4  - Record Teensy CH4 start (wait for complete)")
+        print("  ts  - Show Teensy status")
         print("\n  Ctrl+C - Finish")
         print("\n" + "="*70 + "\n")
         
         self.recorded_positions = []
         self.start_time = time.time()
         self.deadman_active = False
-        
+
         import sys
         import select
         import termios
         import tty
-        
+
         old_settings = termios.tcgetattr(sys.stdin)
         
         try:
@@ -1133,7 +1379,28 @@ class MyBuddyTrainer:
                                     self.set_waist(angle)
                                 except ValueError:
                                     print("\n⚠ Invalid. Use: w45 or wf or wl\n")
-                        
+
+                        # Teensy commands
+                        elif cmd == 't1':
+                            self.record_teensy_action(1)
+                        elif cmd == 't2':
+                            self.record_teensy_action(2)
+                        elif cmd == 't3':
+                            self.record_teensy_action(3)
+                        elif cmd == 't4':
+                            self.record_teensy_action(4)
+                        elif cmd == 'ts':
+                            self.teensy_read_status()
+                            with self.teensy_lock:
+                                if self.teensy_status:
+                                    print(f"\n  Teensy Status:")
+                                    print(f"    Setpoint: {self.teensy_status.get('setpoint', '?')} mL")
+                                    for ch_idx, ch in enumerate(self.teensy_status.get('channels', [])):
+                                        print(f"    CH{ch_idx+1}: {ch.get('state', '?')} - {ch.get('ml', 0):.1f} mL")
+                                    print()
+                                else:
+                                    print("\n  ⚠ No Teensy status available\n")
+
                         input_buffer = ""
                     elif char == '\x03':
                         raise KeyboardInterrupt
@@ -1199,14 +1466,14 @@ def main():
     print("  Left: Flexible Gripper | Right: Parallel OR Vacuum")
     print("  ✓ AUX OUTPUTS: a1on/a1off, a2on/a2off, etc.")
     print("="*70)
-    
-    print("\nSelect RIGHT arm gripper type:")
-    print("  1. Parallel Gripper (default)")
-    print("  2. Vacuum Gripper (GPIO 7)")
-    
-    gripper_choice = input("\nSelect (1 or 2): ").strip()
-    
-    if gripper_choice == '2':
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='MyBuddy 2 Training & Replay System')
+    parser.add_argument('--gripper', '-g', choices=['parallel', 'vacuum'], default='vacuum',
+                        help='Right arm gripper type (default: vacuum)')
+    args = parser.parse_args()
+
+    if args.gripper == 'vacuum':
         right_gripper_type = RIGHT_GRIPPER_VACUUM
         print("✓ Right arm: VACUUM GRIPPER selected")
     else:
@@ -1233,6 +1500,8 @@ def main():
             print("7. Load recording (CSV)")
             print("8. Replay")
             print("9. Gripper/AUX Test Menu")
+            print("h. Go to HOME position")
+            print("s. Set current as HOME")
             print("0. Exit")
             
             choice = input("\nSelect: ").strip()
@@ -1334,7 +1603,13 @@ def main():
                         trainer.set_aux(i, 0)
                 elif test_choice == 's':
                     trainer.show_aux_status()
-            
+
+            elif choice == 'h':
+                trainer.go_home()
+
+            elif choice == 's':
+                trainer.set_home()
+
             elif choice == '0':
                 break
     

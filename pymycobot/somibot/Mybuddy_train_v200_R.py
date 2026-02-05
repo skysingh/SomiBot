@@ -68,8 +68,8 @@ AUX5_PIN = 18
 # Auxiliary pins list for easy iteration
 AUX_PINS = [AUX1_PIN, AUX2_PIN, AUX3_PIN, AUX4_PIN, AUX5_PIN]
 
-# Teensy Serial Configuration
-TEENSY_PORT = '/dev/serial0'  # TX1/RX1 on RPi
+# Teensy Serial Configuration (USB)
+TEENSY_PORT = '/dev/ttyACM1'  # Teensy USB (ACM0 is usually MyBuddy)
 TEENSY_BAUD = 115200
 TEENSY_TIMEOUT = 30  # Seconds to wait for COMPLETE/FAILED
 
@@ -116,16 +116,21 @@ class MyBuddyTrainer:
         # Auxiliary output states (all OFF at startup)
         self.aux_states = [0, 0, 0, 0, 0]  # aux1-aux5
 
-        # Teensy serial communication
+        # Teensy serial communication (try multiple USB ports)
         self.teensy = None
         self.teensy_status = {}
         self.teensy_lock = threading.Lock()
-        try:
-            self.teensy = serial.Serial(TEENSY_PORT, TEENSY_BAUD, timeout=0.1)
-            self.teensy.reset_input_buffer()
-            print(f"  ✓ Teensy connected on {TEENSY_PORT}")
-        except Exception as e:
-            print(f"  ⚠ Teensy not available: {e}")
+        teensy_ports = ['/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0', '/dev/ttyUSB1']
+        for port in teensy_ports:
+            try:
+                self.teensy = serial.Serial(port, TEENSY_BAUD, timeout=0.1)
+                self.teensy.reset_input_buffer()
+                print(f"  ✓ Teensy connected on {port}")
+                break
+            except:
+                continue
+        if not self.teensy:
+            print(f"  ⚠ Teensy not found on {teensy_ports}")
 
         # Setup GPIO
         GPIO.setmode(GPIO.BCM)

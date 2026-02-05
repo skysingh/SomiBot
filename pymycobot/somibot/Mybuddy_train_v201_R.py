@@ -83,7 +83,8 @@ AUX5_PIN = 18
 AUX_PINS = [AUX1_PIN, AUX2_PIN, AUX3_PIN, AUX4_PIN, AUX5_PIN]
 
 # Teensy Serial Configuration (USB)
-TEENSY_PORT = '/dev/ttyACM1'  # Teensy USB (ACM0 is usually MyBuddy)
+# Uses udev rule: /etc/udev/rules.d/99-teensy.rules creates /dev/teensy symlink
+TEENSY_PORT = '/dev/teensy'  # Symlink created by udev rule (ID 16c0:0483)
 TEENSY_BAUD = 115200
 TEENSY_TIMEOUT = 30  # Seconds to wait for COMPLETE/FAILED
 
@@ -130,11 +131,11 @@ class MyBuddyTrainer:
         # Auxiliary output states (all OFF at startup)
         self.aux_states = [0, 0, 0, 0, 0]  # aux1-aux5
 
-        # Teensy serial communication (try multiple USB ports)
+        # Teensy serial communication (try /dev/teensy first, then fallbacks)
         self.teensy = None
         self.teensy_status = {}
         self.teensy_lock = threading.Lock()
-        teensy_ports = ['/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0', '/dev/ttyUSB1']
+        teensy_ports = ['/dev/teensy', '/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0']
         for port in teensy_ports:
             try:
                 self.teensy = serial.Serial(port, TEENSY_BAUD, timeout=0.1)
@@ -1279,7 +1280,7 @@ class MyBuddyTrainer:
         else:
             print("  ro  - Open right gripper (parallel)")
             print("  rc  - Close right gripper (parallel)")
-        print("\nAuxiliary Outputs:")
+        print("\nAuxiliary & Status:")
         print("  a1on / a1off - AUX1 (GPIO 8)")
         print("  a2on / a2off - AUX2 (GPIO 25)")
         print("  a3on / a3off - AUX3 (GPIO 24)")
@@ -1288,16 +1289,13 @@ class MyBuddyTrainer:
         print("  aon  - All AUX ON")
         print("  aoff - All AUX OFF")
         print("  ax   - Show AUX status")
+        print("  ts   - Show Teensy status")
         print("\nWaist Control:")
         print("  w<angle> - Set waist (e.g., w45 or w-30)")
         print("  wf  - Free waist for manual movement")
         print("  wl  - Lock waist")
-        print("\nTeensy Control (pump channels):")
-        print("  t1  - Record Teensy CH1 start (wait for complete)")
-        print("  t2  - Record Teensy CH2 start (wait for complete)")
-        print("  t3  - Record Teensy CH3 start (wait for complete)")
-        print("  t4  - Record Teensy CH4 start (wait for complete)")
-        print("  ts  - Show Teensy status")
+        print("\nTeensy Pump Control:")
+        print("  t1, t2, t3, t4 - Record pump channel start")
         print("\n  Ctrl+C - Finish")
         print("\n" + "="*70 + "\n")
         
